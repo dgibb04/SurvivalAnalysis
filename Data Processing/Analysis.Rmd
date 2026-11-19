@@ -1,5 +1,821 @@
 ---
-title: "Analysis"
-output: html_document
+title: "Survival Analysis of the VA Lung Cancer Trial - R Code"
+author: "Quinn, David, Colin, Zhiyuan"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
 ---
 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.5)
+library(survival)
+```
+
+# 0. Data
+
+The `veteran` data in the `survival` package (Kalbfleisch & Prentice, 1980).
+Treatment and prior therapy are recoded as labelled factors so the output
+and plots are easier to read.
+
+```{r data}
+data(veteran, package = "survival")
+vet <- veteran
+vet$trt   <- factor(vet$trt,   levels = c(1, 2),  labels = c("Standard", "Test"))
+vet$prior <- factor(vet$prior, levels = c(0, 10), labels = c("No", "Yes"))
+str(vet)
+```
+
+Check the counts quoted in the report (137 patients, 69/68 per arm,
+128 deaths, 9 censored):
+
+```{r counts}
+nrow(vet)
+table(vet$trt)
+table(Status = vet$status)      # 1 = died, 0 = censored
+table(vet$trt, vet$celltype)    # patients per treatment x cell type group
+table(vet$trt, vet$status)      # deaths/censored per arm
+summary(vet[, c("time", "karno", "diagtime", "age")])
+```
+
+**Interpretation.**
+
+* The counts match the trial description: 137 patients (69 standard,
+  68 test), 128 deaths and 9 censored times.
+* Censoring is balanced between the arms (5 standard, 4 test), so it does
+  not favour either treatment. This supports the independent-censoring
+  assumption.
+* Cell type is unbalanced between the arms despite randomization: the
+  standard arm has more small-cell patients (30 vs 18) and the test arm has
+  twice as many adeno patients (18 vs 9). Both are poor-prognosis types, so
+  an unadjusted treatment comparison is partly a cell-type comparison. This
+  is the reason for the stratified log-rank test (4.2) and for adjusting for
+  cell type in the AFT model (4.4).
+* Treatment x cell-type groups contain between 9 (standard, adeno) and 30
+  (standard, small cell) patients, so the interaction test (4.5) has
+  limited power.
+* Survival time is strongly right-skewed: median 80 days, mean 121.6,
+  maximum 999.
+* Karnofsky score covers almost the whole scale (10-99, median 60), and age
+  runs from 34 to 81.
+* Time since diagnosis is very skewed (median 5 months, maximum 87), so a
+  few patients could have a large influence on its coefficient.
+
+# 4.0 Expected distribution
+
+**Why:** before estimating anything, we use what we know about the data to
+propose candidate distributions for T. T is time to death in men with
+advanced, inoperable lung cancer, so we expect short, strongly right-skewed
+survival times (confirmed above: median 80 days, mean 121.6, max 999).
+
+* *Exponential* (constant hazard): the simplest model, used by Prentice (1973).
+* *Weibull* (hazard only rising or only falling).
+* *Log-logistic / lognormal* (hazard rises then falls): common in cancer
+  survival, especially in a mixed population like this one.
+
+Only 7% of times are censored, so a histogram of observed times gives a fair
+rough picture of the shape.
+
+```{r expected-dist}
+hist(vet$time, breaks = 30, main = "Observed survival times",
+     xlab = "Days since randomization")
+```
+
+**Interpretation.**
+
+* Most deaths occur in the first 200 days, with a long thin tail out to
+  999 days. The shape is consistent with all four candidates.
+* The histogram cannot tell them apart. That needs the nonparametric
+  estimates of S(t) and H(t), which the plots in 4.3 use.
+
+# 4.1 Kaplan-Meier estimates
+
+**Why:** the Kaplan-Meier estimator estimates S(t) without assuming a
+distribution and handles right censoring. Variances use Greenwood's formula
+(the `survfit` default). We use log-log confidence intervals, which stay
+inside [0, 1].
+
+```{r km-fit}
+km_all  <- survfit(Surv(time, status) ~ 1,        data = vet, conf.type = "log-log")
+km_trt  <- survfit(Surv(time, status) ~ trt,      data = vet, conf.type = "log-log")
+km_cell <- survfit(Surv(time, status) ~ celltype, data = vet, conf.type = "log-log")
+```
+
+Median survival times with 95% CIs:
+
+```{r km-medians}
+print(km_all)
+print(km_trt)
+print(km_cell)
+```
+
+Estimated survival at 3, 6 and 12 months by treatment:
+
+```{r km-times}
+summary(km_trt, times = c(90, 180, 365))
+```
+
+```{r km-plot-overall}
+plot(km_all, xlab = "Days since randomization", ylab = "Estimated S(t)",
+     main = "Kaplan-Meier estimate, all patients (95% log-log CI)")
+```
+
+```{r km-plot-trt}
+plot(km_trt, col = c("blue", "red"), lwd = 2,
+     xlab = "Days since randomization", ylab = "Estimated S(t)",
+     main = "Kaplan-Meier estimate by treatment")
+legend("topright", legend = levels(vet$trt), col = c("blue", "red"),
+       lwd = 2, bty = "n")
+```
+
+```{r km-plot-cell}
+plot(km_cell, col = 1:4, lwd = 2,
+     xlab = "Days since randomization", ylab = "Estimated S(t)",
+     main = "Kaplan-Meier estimate by cell type")
+legend("topright", legend = levels(vet$celltype), col = 1:4,
+       lwd = 2, bty = "n")
+```
+
+**Interpretation: all patients.**
+
+* Median survival is 80 days (95% CI 52-100). About half the patients die
+  within 3 months, and very few survive past a year.
+* The tail beyond 365 days rests on 4-6 patients per arm, so estimates there
+  are imprecise.
+
+**Interpretation: by treatment.**
+
+| | Median (95% CI) | S(90) | S(180) | S(365) |
+|---|---|---|---|---|
+| Standard | 103 (54-126) | 0.55 | 0.21 | 0.07 |
+| Test | 52.5 (43-90) | 0.38 | 0.23 | 0.11 |
+
+* There is no sign that the test treatment prolongs survival. Its median is
+  lower, but the confidence intervals overlap heavily.
+* The curves cross at about 150-200 days: standard does better early, and
+  test does slightly better later.
+  * When curves cross, the log-rank test loses power because early and late
+    differences cancel out. We therefore also run the Peto-Peto version
+    (`rho = 1`) in 4.2.
+  * The crossing also suggests the treatment effect may not be constant.
+* Part of the early gap may come from cell type: the test arm had twice as
+  many adeno patients, and adeno patients die fastest. The stratified test
+  (4.2) and the AFT model (4.4) adjust for this.
+
+**Interpretation: by cell type.**
+
+| | Median (95% CI) |
+|---|---|
+| Large | 156 (100-216) |
+| Squamous | 118 (44-242) |
+| Small cell | 51 (24-61) |
+| Adeno | 51 (24-90) |
+
+* The cell types fall into two groups.
+  * Small cell and adeno patients die quickly; every adeno patient had died
+    by about 180 days.
+  * Large cell and squamous patients survive about 2-3 times longer.
+* The large-cell and squamous curves cross. Large cell does better in the
+  first ~150 days and squamous does better later, with the longest tail.
+  * The curves differ in shape, not only in location.
+  * This matters when we choose a distribution (4.3) and check whether one
+    scale parameter fits all groups.
+
+# 4.2 Log-rank tests
+
+**Why:** the log-rank test compares whole survival curves
+(H0: S1(t) = S2(t) for all t) without assuming a distribution, and is the
+standard test for a randomized trial. It is most powerful when one curve stays
+above the other. The treatment curves cross at about 150-200 days, so we also
+run the `rho = 1` version (Peto-Peto), which puts more weight on early
+differences, as a check.
+
+Treatment (H0: S_test = S_standard):
+
+```{r lr-trt}
+survdiff(Surv(time, status) ~ trt, data = vet)
+survdiff(Surv(time, status) ~ trt, data = vet, rho = 1)
+```
+
+Cell type (H0: all four curves equal, df = 3):
+
+```{r lr-cell}
+survdiff(Surv(time, status) ~ celltype, data = vet)
+```
+
+Treatment, stratified by cell type. **Why:** cell type is unbalanced between
+the arms (e.g. 9 vs 18 adeno patients), so this compares treatments within
+each cell type and then combines the results.
+
+```{r lr-trt-strat}
+survdiff(Surv(time, status) ~ trt + strata(celltype), data = vet)
+```
+
+**Interpretation.**
+
+| Test | Chi-square | df | p-value |
+|---|---|---|---|
+| Treatment, log-rank | 0.01 | 1 | 0.93 |
+| Treatment, Peto-Peto (`rho = 1`) | 0.87 | 1 | 0.35 |
+| Cell type, log-rank | 25.4 | 3 | 0.00001 |
+| Treatment, stratified by cell type | 0.70 | 1 | 0.40 |
+
+* **Treatment:** no evidence of a difference between the two
+  chemotherapies (p = 0.93).
+  * Observed deaths almost equal expected deaths in both arms (64 vs 64.5
+    standard, 64 vs 63.5 test).
+  * The Peto-Peto test, which weights early deaths more, is also not
+    significant (p = 0.35). So the conclusion does not depend on the curves
+    crossing.
+  * We do not reject H0: S_test(t) = S_standard(t). The data give no
+    evidence that the test chemotherapy prolongs survival.
+* **Cell type:** survival differs strongly between the four cell types
+  (p = 0.00001).
+  * Small cell (45 observed vs 30.1 expected deaths) and adeno (26 vs 15.7)
+    have more deaths than expected.
+  * Squamous (31 vs 47.7) and large cell (26 vs 34.5) have fewer.
+  * This confirms the two groups seen in the Kaplan-Meier curves. Cell type
+    is an important prognostic factor and must be included in the
+    regression model.
+* **Treatment adjusted for cell type:** still no difference (p = 0.40).
+  * Within cell types, the test arm has slightly more deaths than expected
+    (64 vs 59.8), but not significantly.
+  * The cell-type imbalance between the arms does not explain the lack of
+    a treatment effect.
+
+# 4.3 Choosing a distribution
+
+**Why:** an AFT model needs a distribution for T. We check the candidates
+from 4.0 graphically, then by likelihood.
+
+* **Graphical check:** the Nelson-Aalen estimate of the cumulative hazard
+  H(t) is transformed so that each candidate distribution would give a
+  straight line:
+  * exponential: H(t) against t (a straight line through the origin)
+  * Weibull: log H(t) against log t
+  * log-logistic: log[(1 - S)/S] = log(exp(H) - 1) against log t
+  * lognormal: qnorm(1 - S) against log t
+* **Nelson-Aalen estimate:** we get it as in the course notes, from the
+  Fleming-Harrington fit (`type = "fh2"`), with H(t) = -log S(t).
+
+```{r na-fit}
+na_all <- survfit(Surv(time, status) ~ 1, data = vet, type = "fh2")
+na_df  <- data.frame(t = na_all$time, S = na_all$surv)
+na_df  <- subset(na_df, S > 0 & S < 1)      # drop points where transforms are undefined
+na_df$H    <- -log(na_df$S)
+na_df$logt <- log(na_df$t)
+```
+
+```{r linearizing-plots, fig.width = 8, fig.height = 7}
+par(mfrow = c(2, 2))
+plot(na_df$t, na_df$H, type = "s", xlab = "t (days)", ylab = "H(t)",
+     main = "Exponential: H(t) vs t")
+plot(na_df$logt, log(na_df$H), type = "s", xlab = "log t", ylab = "log H(t)",
+     main = "Weibull: log H(t) vs log t")
+plot(na_df$logt, log(exp(na_df$H) - 1), type = "s", xlab = "log t",
+     ylab = "log[(1-S)/S]", main = "Log-logistic: log-odds vs log t")
+plot(na_df$logt, qnorm(1 - na_df$S), type = "s", xlab = "log t",
+     ylab = "qnorm(1-S)", main = "Lognormal: qnorm(1-S) vs log t")
+par(mfrow = c(1, 1))
+```
+
+**Weibull plot by cell type.** If one AFT model with a common scale fits,
+these four lines should be roughly parallel (shifted only).
+
+```{r weibull-by-cell}
+na_cell <- survfit(Surv(time, status) ~ celltype, data = vet, type = "fh2")
+cols <- 1:4
+plot(NULL, xlim = range(log(vet$time)), ylim = c(-5, 2),
+     xlab = "log t", ylab = "log H(t)", main = "Weibull plot by cell type")
+for (i in seq_along(levels(vet$celltype))) {
+  s  <- na_cell[i]
+  ok <- s$surv > 0 & s$surv < 1
+  lines(log(s$time[ok]), log(-log(s$surv[ok])), type = "s", col = cols[i], lwd = 2)
+}
+legend("bottomright", legend = levels(vet$celltype), col = cols, lwd = 2, bty = "n")
+```
+
+**Likelihood comparison.** We fit each distribution with `survreg`, twice:
+
+* **Without covariates:** describes the distribution of T for the whole
+  sample.
+* **With all covariates:** this is what the AFT model will actually use,
+  because the distribution is assumed for the error term after adjusting
+  for covariates.
+
+The Weibull, log-logistic and lognormal models have the same number of
+parameters, so the one with the largest log-likelihood fits best. Exponential
+is Weibull with scale = 1, so we compare those two with a likelihood ratio
+test (df = 1).
+
+```{r dist-fits}
+dists <- c("exponential", "weibull", "loglogistic", "lognormal")
+
+fit0 <- lapply(dists, function(d) survreg(Surv(time, status) ~ 1, data = vet, dist = d))
+fitX <- lapply(dists, function(d) survreg(Surv(time, status) ~ trt + celltype + karno +
+                                            diagtime + age + prior, data = vet, dist = d))
+
+dist_table <- data.frame(
+  distribution        = dists,
+  loglik_no_covariates = sapply(fit0, function(f) f$loglik[2]),
+  loglik_covariates    = sapply(fitX, function(f) f$loglik[2]),
+  scale_covariates     = sapply(fitX, function(f) f$scale)
+)
+dist_table
+```
+
+Likelihood ratio test, exponential vs Weibull (H0: scale = 1):
+
+```{r lrt-exp-weibull}
+lrt <- function(small, big, df) {
+  stat <- 2 * (big$loglik[2] - small$loglik[2])
+  c(LR = stat, df = df, p = pchisq(stat, df, lower.tail = FALSE))
+}
+lrt(fit0[[1]], fit0[[2]], 1)   # no covariates
+lrt(fitX[[1]], fitX[[2]], 1)   # all covariates
+```
+
+
+**Interpretation: linearizing plots.**
+
+* All four plots are roughly straight through the middle of the data, so
+  the graphs alone do not clearly separate the candidates. This is common
+  with skewed data and few late survivors.
+* Exponential (H(t) vs t) fits least well. The plot is close to linear for
+  the first ~400 days, then flattens and jumps where only a few patients
+  remain at risk.
+* Weibull, log-logistic and lognormal all look reasonably linear against
+  log t. The likelihood comparison is needed to choose between them.
+
+**Interpretation: Weibull plot by cell type.**
+
+* Small cell and adeno lie above squamous and large cell, which confirms
+  their higher cumulative hazard.
+* The lines are roughly parallel through the middle, which supports a
+  common-scale AFT model.
+* The squamous line is flatter at the top and crosses large cell at about
+  log t = 5.5 (around 250 days). The squamous group may have a different
+  shape, so we check a cell-type-specific scale in 4.6.
+
+**Interpretation: likelihood comparison.**
+
+| Distribution | Log-lik, no covariates | Log-lik, all covariates | Scale (covariates) |
+|---|---|---|---|
+| Exponential | -751.2 | -716.2 | 1 (fixed) |
+| Weibull | -748.1 | -715.6 | 0.93 |
+| Log-logistic | -750.3 | **-711.9** | 0.58 |
+| Lognormal | -749.5 | -714.6 | 1.06 |
+
+* **Without covariates**, Weibull fits best, and the exponential is
+  rejected (LR = 6.26, df = 1, p = 0.012).
+* **With covariates**, the exponential is no longer rejected against the
+  Weibull (LR = 1.22, df = 1, p = 0.27; Weibull scale 0.93, close to 1).
+  * This agrees with Prentice (1973), who found the Weibull shape close
+    to 1.
+  * The two results differ because, without covariates, T mixes patients
+    with very different prognoses. A mix of high-risk patients (who die
+    early) and low-risk patients makes the overall hazard appear to fall
+    over time. Once covariates account for these differences, a constant
+    hazard is adequate within the Weibull family.
+* **With covariates, log-logistic fits best.** Its log-likelihood is 3.6
+  higher than the Weibull's, with the same number of parameters.
+  * The two models are not nested, so they cannot be compared with a
+    likelihood ratio test. With equal numbers of parameters, the larger
+    log-likelihood is the better fit (this is also what AIC would give).
+  * The log-logistic scale is 0.58 < 1, which means a hazard that rises
+    and then falls. This matches the expectation in 4.0 for advanced
+    cancer.
+* **Decision:** we use the **log-logistic AFT model** as the main model.
+  We also fit the **Weibull** model (which includes Prentice's exponential
+  as a special case) for comparison. Section 4.6 checks this choice with
+  Cox-Snell residuals.
+
+# 4.4 Accelerated failure time regression
+
+**Model:** log T = x'beta + sigma W, where W has a standard logistic
+distribution (log-logistic T).
+
+* exp(beta_j) is a **time ratio**: the factor by which survival time is
+  multiplied for a one-unit increase in x_j, holding the other covariates
+  fixed. A time ratio above 1 means longer survival.
+* We start with all covariates. We remove non-significant ones using Wald
+  tests for single coefficients and likelihood ratio tests for groups (cell
+  type has 3 coefficients).
+* Treatment stays in the model whatever its p-value, because it answers
+  the primary question.
+
+```{r aft-full}
+aft_full <- survreg(Surv(time, status) ~ trt + celltype + karno + diagtime +
+                      age + prior, data = vet, dist = "loglogistic")
+summary(aft_full)
+```
+
+Likelihood ratio tests for dropping each covariate from the full model:
+
+```{r aft-drop}
+drop_lrt <- function(term, df) {
+  smaller <- update(aft_full, as.formula(paste(". ~ . -", term)))
+  lrt(smaller, aft_full, df)
+}
+rbind(
+  celltype = drop_lrt("celltype", 3),
+  karno    = drop_lrt("karno", 1),
+  diagtime = drop_lrt("diagtime", 1),
+  age      = drop_lrt("age", 1),
+  prior    = drop_lrt("prior", 1),
+  trt      = drop_lrt("trt", 1)
+)
+```
+
+Reduced model with the non-significant covariates (diagtime, age, prior)
+removed together, and a joint test that they can be dropped (df = 3):
+
+```{r aft-reduced}
+aft_red <- survreg(Surv(time, status) ~ trt + celltype + karno,
+                   data = vet, dist = "loglogistic")
+summary(aft_red)
+lrt(aft_red, aft_full, 3)
+```
+
+Time ratios with 95% Wald confidence intervals for the reduced model:
+
+```{r time-ratios}
+time_ratios <- function(fit) {
+  est <- coef(fit)
+  se  <- sqrt(diag(vcov(fit)))[names(est)]
+  round(cbind(TR    = exp(est),
+              lower = exp(est - 1.96 * se),
+              upper = exp(est + 1.96 * se)), 3)
+}
+time_ratios(aft_red)
+```
+
+The same reduced model under the Weibull distribution, for comparison:
+
+```{r aft-weibull}
+aft_red_w <- survreg(Surv(time, status) ~ trt + celltype + karno,
+                     data = vet, dist = "weibull")
+summary(aft_red_w)
+time_ratios(aft_red_w)
+```
+
+**Interpretation: model selection.**
+
+| Term dropped from full model | LR | df | p |
+|---|---|---|---|
+| Cell type | 15.33 | 3 | 0.0016 |
+| Karnofsky score | 52.91 | 1 | < 0.0001 |
+| Time since diagnosis | 0.04 | 1 | 0.84 |
+| Age | 0.92 | 1 | 0.34 |
+| Prior therapy | 0.23 | 1 | 0.63 |
+| Treatment | 0.24 | 1 | 0.62 |
+
+* Only Karnofsky score and cell type are significant.
+* Time since diagnosis, age and prior therapy can be dropped together
+  (LR = 1.21, df = 3, p = 0.75).
+* The **final model** is therefore log T = trt + celltype + karno. Treatment
+  stays in because it is the primary question.
+* This agrees with Prentice (1973), who found performance status to be the
+  main prognostic factor. We also keep cell type, which is clearly
+  significant here.
+
+**Interpretation: time ratios (log-logistic, final model).**
+
+| Covariate | Time ratio (95% CI) | Meaning |
+|---|---|---|
+| Test vs standard | 0.95 (0.67-1.34) | No evidence of a treatment effect (p = 0.76) |
+| Small cell vs squamous | 0.50 (0.31-0.80) | Survival about half as long |
+| Adeno vs squamous | 0.46 (0.27-0.78) | Survival about half as long |
+| Large vs squamous | 0.97 (0.58-1.62) | No difference |
+| Karnofsky, +1 point | 1.037 (1.028-1.046) | |
+| Karnofsky, +10 points | 1.43 (1.31-1.56) | Survival about 43% longer |
+
+* **Treatment:** after adjusting for cell type and Karnofsky score, the
+  test chemotherapy multiplies survival time by an estimated 0.95. The CI
+  runs from a 33% reduction to a 34% increase, so the data are consistent
+  with no effect. This answers the primary objective: there is no evidence
+  that the test chemotherapy prolongs survival.
+* **Karnofsky score** is the strongest predictor. Each 10-point increase
+  multiplies survival time by about 1.43.
+* **Cell type:** small cell and adeno patients survive about half as long
+  as squamous patients with the same treatment and Karnofsky score. Large
+  cell and squamous do not differ. This matches the two groups in the
+  Kaplan-Meier curves.
+* **Predicted medians:** for a log-logistic model the median of T is
+  exp(x'beta), because the standard logistic distribution has median 0.
+  * Squamous, standard treatment, Karnofsky 60: exp(2.519 + 0.0359 x 60)
+    = about 107 days.
+  * The same patient with small cell: about 53 days.
+  * Squamous, standard treatment, Karnofsky 30: about 37 days.
+* **Weibull comparison:** the conclusions are the same. Treatment is not
+  significant (TR 0.81, p = 0.25), Karnofsky is strong (1.34 per 10
+  points), and small cell and adeno are worse. One difference is large
+  cell vs squamous: TR 0.68 under Weibull vs 0.97 under log-logistic,
+  not significant in either. This reflects the crossing large-cell and
+  squamous curves, which the two distributions handle differently.
+  Log-logistic fits better (log-likelihood -712.5 vs -715.9), so we keep it
+  as the main model.
+
+# 4.5 Treatment x cell-type interaction
+
+**Why:** Prentice (1973) found that the treatment effect seemed to point in
+different directions for different cell types but did not test it. We add
+the treatment x cell-type interaction to the final model and test the three
+interaction terms together (H0: no interaction) with a likelihood ratio test,
+df = 3, under both log-logistic and Weibull.
+
+```{r interaction-lrt}
+aft_int   <- survreg(Surv(time, status) ~ trt * celltype + karno,
+                     data = vet, dist = "loglogistic")
+aft_int_w <- survreg(Surv(time, status) ~ trt * celltype + karno,
+                     data = vet, dist = "weibull")
+summary(aft_int)
+lrt(aft_red,   aft_int,   3)   # log-logistic
+lrt(aft_red_w, aft_int_w, 3)   # Weibull
+```
+
+Treatment time ratio within each cell type. **Why:** this is the same model
+written so that each coefficient is directly the treatment effect for one
+cell type, which is easier to read than interaction terms.
+
+```{r interaction-by-cell}
+aft_nest <- survreg(Surv(time, status) ~ celltype + celltype:trt + karno,
+                    data = vet, dist = "loglogistic")
+time_ratios(aft_nest)[grep("trt", names(coef(aft_nest))), ]
+```
+
+**Interpretation.**
+
+| Distribution | LR | df | p |
+|---|---|---|---|
+| Log-logistic | 0.78 | 3 | 0.85 |
+| Weibull | 6.98 | 3 | 0.07 |
+
+| Cell type | Treatment time ratio, test vs standard (95% CI) |
+|---|---|
+| Squamous | 1.09 (0.51-2.32) |
+| Small cell | 0.90 (0.50-1.62) |
+| Adeno | 1.14 (0.54-2.43) |
+| Large | 0.75 (0.37-1.55) |
+
+* **No significant interaction.** Under the log-logistic model there is
+  no evidence that the treatment effect depends on cell type (p = 0.85).
+  Under the Weibull model the evidence is weak and not significant at the
+  5% level (p = 0.07). The Weibull model fits worse (4.3, 4.4), so we rely
+  on the log-logistic result.
+* **The pattern Prentice described is visible but small.** The estimated
+  treatment effect points in different directions: slightly longer
+  survival on the test treatment for squamous and adeno, slightly shorter
+  for small cell and large cell.
+  * These are the same directions as Prentice's (1973) adjusted expected
+    survival times, where the test treatment was higher for squamous and
+    adeno and lower for small and large cell.
+  * Every confidence interval contains 1, and the joint test shows these
+    differences are consistent with chance.
+* **This answers Prentice's open question:** the apparent differences in
+  treatment effect across cell types are not statistically significant.
+* **Caveat:** the groups are small (9-30 patients each), so the test has
+  low power. A non-significant result does not show the effects are equal;
+  the confidence intervals are wide enough to allow moderate differences.
+
+# 4.6 Model assessment
+
+**Why:** the conclusions depend on the log-logistic AFT model being
+adequate. We check it in three ways:
+
+1. **Cox-Snell residuals.**
+   * r_i = -log S(t_i | x_i) from the fitted model. If the model is right,
+     the r_i behave like a censored sample from the unit exponential
+     distribution.
+   * So the Nelson-Aalen cumulative hazard of the r_i should follow the
+     45-degree line.
+   * We compute them for both the log-logistic and Weibull final models
+     to compare the two distributions.
+     * Log-logistic: r = log(1 + exp(z)).
+     * Weibull: r = exp(z).
+     * In both, z = (log t - x'beta) / sigma.
+2. **Deviance residuals** plotted against the linear predictor and against
+   time. They should show no pattern.
+3. **Common scale across cell types.**
+   * The Weibull plot in 4.3 suggested squamous may have a different
+     shape.
+   * We let each cell type have its own scale (`strata(celltype)`, as in
+     the course notes) and test this against a common scale with a
+     likelihood ratio test (df = 3).
+
+```{r cox-snell}
+cs_resid <- function(fit, dist) {
+  z <- (log(vet$time) - fit$linear.predictors) / fit$scale
+  if (dist == "loglogistic") log(1 + exp(z)) else exp(z)
+}
+cs_ll <- cs_resid(aft_red,   "loglogistic")
+cs_w  <- cs_resid(aft_red_w, "weibull")
+
+cs_plot <- function(r, title) {
+  f <- survfit(Surv(r, vet$status) ~ 1, type = "fh2")
+  plot(f$time, -log(f$surv), type = "s", xlab = "Cox-Snell residual",
+       ylab = "Estimated cumulative hazard", main = title)
+  abline(0, 1, lty = 2, col = "red")
+}
+par(mfrow = c(1, 2))
+cs_plot(cs_ll, "Log-logistic")
+cs_plot(cs_w,  "Weibull")
+par(mfrow = c(1, 1))
+```
+
+```{r deviance}
+dev_ll <- residuals(aft_red, type = "deviance")
+par(mfrow = c(1, 2))
+plot(aft_red$linear.predictors, dev_ll, xlab = "Linear predictor",
+     ylab = "Deviance residual", main = "vs linear predictor")
+abline(h = 0, lty = 2)
+plot(vet$time, dev_ll, log = "x", xlab = "Time (days, log scale)",
+     ylab = "Deviance residual", main = "vs time")
+abline(h = 0, lty = 2)
+par(mfrow = c(1, 1))
+
+# patients with large residuals
+vet[abs(dev_ll) > 2.5, c("time", "status", "trt", "celltype", "karno")]
+```
+
+```{r scale-by-cell}
+aft_strat <- survreg(Surv(time, status) ~ trt + celltype + karno + strata(celltype),
+                     data = vet, dist = "loglogistic")
+aft_strat$scale
+lrt(aft_red, aft_strat, 3)
+```
+
+**Interpretation: Cox-Snell residuals.**
+
+* **Log-logistic:** the cumulative hazard of the residuals follows the
+  45-degree line closely up to about 3.5. Beyond that, a few large
+  residuals sit near the line, but there are too few points in the tail to
+  judge.
+* **Weibull:** the plot falls below the line from about 2.5 onward and
+  ends far to the right (largest residual about 8). The Weibull model
+  underestimates the hazard for the longest survivors.
+* This confirms the choice in 4.3: the **log-logistic model fits
+  better**.
+
+**Interpretation: deviance residuals.**
+
+* **Against the linear predictor:** a random scatter around 0 with no
+  trend or funnel shape. The covariates enter the model in an adequate
+  form.
+* **Against time:** a rising trend. This is expected by construction and
+  does not indicate lack of fit. For patients with similar covariates, the
+  one who dies earlier always has a more negative residual, so plotting a
+  residual against its own response must slope upward.
+* **Large residuals (|r| > 2.5):** four of 137 patients.
+  * Three squamous patients died much earlier than predicted. Two died on
+    day 1 (Karnofsky 20 and 50) and one on day 11 (Karnofsky 70).
+  * One small-cell patient with Karnofsky 40 lived 392 days, much longer
+    than predicted.
+  * These look like real outcomes rather than data errors, so we keep
+    them.
+  * Squamous patients appear among both the earliest deaths and the
+    longest survivors, which fits the scale result below.
+
+**Interpretation: common scale across cell types.**
+
+| Cell type | Squamous | Small cell | Adeno | Large |
+|---|---|---|---|---|
+| Scale | 0.79 | 0.61 | 0.45 | 0.41 |
+
+* A common scale is **rejected** (LR = 11.56, df = 3, p = 0.009).
+* The spread of log survival time differs by cell type. Squamous is the
+  most variable, with both very early deaths and the longest survivors.
+  Large cell and adeno are the least variable.
+* This matches the crossing large-cell and squamous Kaplan-Meier curves
+  (4.1) and the flatter squamous line in the Weibull plot (4.3).
+* So the common-scale model in 4.4 is a simplification. We check below
+  whether the main conclusions change when each cell type has its own
+  scale.
+
+## 4.6.1 Sensitivity analysis: cell-type-specific scale
+
+**Why:** the common-scale assumption was rejected, so we refit the final
+model and the interaction test with a separate scale for each cell type. If
+the treatment and Karnofsky conclusions are unchanged, they do not depend
+on that assumption.
+
+```{r sens-strat}
+summary(aft_strat)
+time_ratios(aft_strat)
+```
+
+Interaction test with cell-type-specific scales (df = 3):
+
+```{r sens-interaction}
+aft_int_strat <- survreg(Surv(time, status) ~ trt * celltype + karno + strata(celltype),
+                         data = vet, dist = "loglogistic")
+lrt(aft_strat, aft_int_strat, 3)
+```
+
+Cox-Snell residuals for the stratified model:
+
+```{r sens-cox-snell}
+sc_i <- aft_strat$scale[as.character(vet$celltype)]
+z_s  <- (log(vet$time) - aft_strat$linear.predictors) / sc_i
+cs_s <- log(1 + exp(z_s))
+cs_plot(cs_s, "Log-logistic, cell-type-specific scale")
+```
+
+**Interpretation.**
+
+| | Common scale (4.4) | Cell-type-specific scale |
+|---|---|---|
+| Test vs standard, TR (95% CI) | 0.95 (0.67-1.34) | 0.92 (0.67-1.27) |
+| Small cell vs squamous | 0.50 | 0.50 |
+| Adeno vs squamous | 0.46 | 0.47 |
+| Large vs squamous | 0.97 | 0.96 |
+| Karnofsky, +1 point | 1.037 | 1.037 |
+| Interaction test p-value | 0.85 | 0.83 |
+| Log-likelihood | -712.5 | -706.8 |
+
+* **The conclusions do not change.**
+  * Treatment is still not significant (p = 0.62).
+  * The Karnofsky and cell-type time ratios are almost identical.
+  * There is still no treatment x cell-type interaction (p = 0.83).
+* The stratified model fits better (log-likelihood 5.7 higher, p = 0.009
+  from 4.6). Its Cox-Snell residuals follow the 45-degree line closely up
+  to about 4, slightly better than the common-scale model.
+* **Conclusion:** we report the common-scale model (4.4) as the main model
+  because it is simpler and matches the analysis plan. Allowing each cell
+  type its own scale improves the fit but leaves every conclusion
+  unchanged, so the results do not depend on the common-scale assumption.
+
+# 4.8 Supplementary group comparisons
+
+**Why:** these plots show the group differences behind the model
+results. They are descriptive and can be moved into Sections 4.1-4.2 of
+the report.
+
+**Treatment within each cell type.** This shows the interaction question
+directly. The within-cell log-rank p-values are descriptive only: the groups
+are small and four tests are made, so they are not a substitute for the
+formal interaction test in 4.5.
+
+```{r km-trt-by-cell, fig.width = 8, fig.height = 7}
+par(mfrow = c(2, 2))
+for (ct in levels(vet$celltype)) {
+  d  <- subset(vet, celltype == ct)
+  km <- survfit(Surv(time, status) ~ trt, data = d)
+  lr <- survdiff(Surv(time, status) ~ trt, data = d)
+  p  <- pchisq(lr$chisq, 1, lower.tail = FALSE)
+  plot(km, col = c("blue", "red"), lwd = 2, xlab = "Days", ylab = "S(t)",
+       main = sprintf("%s (log-rank p = %.2f)", ct, p))
+  legend("topright", legend = levels(vet$trt), col = c("blue", "red"),
+         lwd = 2, bty = "n")
+}
+par(mfrow = c(1, 1))
+```
+
+**Karnofsky score groups.** We use the categories described by Prentice
+(1973): 10-30 completely hospitalized, 40-60 partially confined to hospital,
+70-90 able to care for self. This makes the strongest covariate effect
+visible.
+
+```{r km-karno}
+vet$karno_grp <- cut(vet$karno, breaks = c(0, 30, 60, 100),
+                     labels = c("10-30 hospitalized", "40-60 partial", "70+ self-care"))
+table(vet$karno_grp)
+km_karno <- survfit(Surv(time, status) ~ karno_grp, data = vet, conf.type = "log-log")
+print(km_karno)
+survdiff(Surv(time, status) ~ karno_grp, data = vet)
+plot(km_karno, col = 1:3, lwd = 2, xlab = "Days since randomization",
+     ylab = "Estimated S(t)", main = "Kaplan-Meier estimate by Karnofsky group")
+legend("topright", legend = levels(vet$karno_grp), col = 1:3, lwd = 2, bty = "n")
+```
+
+**Interpretation: treatment within each cell type.**
+
+| Cell type | Log-rank p | Pattern |
+|---|---|---|
+| Squamous | 0.12 | Test does better after about 150 days |
+| Small cell | 0.13 | Standard does better; no test patient survives past about 100 days |
+| Adeno | 0.63 | Curves close together |
+| Large | 0.29 | Standard does better in the first ~200 days |
+
+* None of the within-cell differences is significant. The directions
+  match Prentice (1973) and our time ratios in 4.5: test is favoured for
+  squamous, standard for small cell and large cell.
+* These four tests are descriptive. The formal answer is the interaction
+  test in 4.5 (p = 0.85).
+
+**Interpretation: Karnofsky groups.**
+
+| Karnofsky group | n | Median survival (95% CI) |
+|---|---|---|
+| 10-30, completely hospitalized | 22 | 19.5 days (13-25) |
+| 40-60, partially confined | 57 | 52 days (30-80) |
+| 70+, able to care for self | 58 | 132 days (110-162) |
+
+* Survival differs strongly between the groups (log-rank chi-square = 51,
+  df = 2, p < 0.0001).
+* All 22 completely hospitalized patients died, all within about 150 days.
+  There were 22 deaths against 6.5 expected.
+* Median survival rises from about 3 weeks to about 4 months across the
+  three groups. This is the clearest picture of why Karnofsky score is the
+  strongest predictor in the AFT model and in Prentice (1973).
